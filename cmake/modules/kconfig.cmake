@@ -355,7 +355,7 @@ if(EXISTS ${DOTCONFIG} AND EXISTS ${merge_config_files_checksum_file})
 endif()
 
 if(CREATE_NEW_DOTCONFIG)
-  set(input_configs_flags --handwritten-input-configs)
+  # set(input_configs_flags --handwritten-input-configs)
   set(input_configs ${merge_config_files} ${FORCED_CONF_FILE})
   build_info(kconfig files PATH ${input_configs})
 else()

@@ -113,29 +113,12 @@ static void udc_event_xfer_in_callback(void *cbdata)
 static void udc_event_xfer_out_callback(void *cbdata)
 {
 	struct req_cb_data *req_cb_data = (struct req_cb_data *)cbdata;
-	struct udc_max32_data *priv = udc_get_private(req_cb_data->dev);
-	MXC_USB_Req_t *ep_request = &priv->ep_request[USB_EP_GET_IDX(req_cb_data->ep)];
-	struct net_buf *buf;
+	struct udc_max32_evt evt = {
+		.type = UDC_MAX32_EVT_XFER_OUT_DONE,
+		.ep_cfg = udc_get_ep_cfg(req_cb_data->dev, req_cb_data->ep),
+	};
 
-	buf = udc_buf_get(udc_get_ep_cfg(req_cb_data->dev, req_cb_data->ep));
-	net_buf_add(buf, ep_request->actlen);
-
-	udc_ep_set_busy(udc_get_ep_cfg(req_cb_data->dev, req_cb_data->ep), false);
-
-	if (ep_request->error_code) {
-		LOG_ERR("ep 0x%02x error: %x", req_cb_data->ep, ep_request->error_code);
-		udc_submit_ep_event(req_cb_data->dev, buf, ep_request->error_code);
-		return;
-	}
-
-	if (req_cb_data->ep == USB_CONTROL_EP_OUT) {
-		/* Update to next stage of control transfer */
-		udc_ctrl_update_stage(req_cb_data->dev, buf);
-
-		udc_ctrl_submit_s_out_status(req_cb_data->dev, buf);
-	} else {
-		udc_submit_ep_event(req_cb_data->dev, buf, 0);
-	}
+	k_msgq_put(&drv_msgq, &evt, K_NO_WAIT);
 }
 
 static void udc_event_xfer_in(const struct device *dev, struct udc_ep_config *ep_cfg)
@@ -147,6 +130,7 @@ static void udc_event_xfer_in(const struct device *dev, struct udc_ep_config *ep
 	int ret;
 
 	if (udc_ep_is_busy(ep_cfg)) {
+		LOG_WRN("xfer_in: ep 0x%02x busy, START_XFER deferred", ep_cfg->addr);
 		return;
 	}
 
@@ -196,6 +180,7 @@ static void udc_event_xfer_out(const struct device *dev, struct udc_ep_config *e
 	int ret;
 
 	if (udc_ep_is_busy(ep_cfg)) {
+		LOG_WRN("xfer_out: ep 0x%02x busy, START_XFER deferred", ep_cfg->addr);
 		return;
 	}
 
@@ -223,6 +208,81 @@ static void udc_event_xfer_out(const struct device *dev, struct udc_ep_config *e
 		udc_ep_set_busy(ep_cfg, false);
 		LOG_ERR("ep 0x%02x error: %x", ep_cfg->addr, ret);
 		udc_submit_ep_event(dev, buf, -ECONNREFUSED);
+	}
+}
+
+/*
+ * Thread-context (non ISR-safe) handlers for xfer completions.
+ */
+static void udc_event_xfer_in_done(const struct device *dev, struct udc_ep_config *ep_cfg)
+{
+	struct udc_max32_data *priv = udc_get_private(dev);
+	MXC_USB_Req_t *ep_request = &priv->ep_request[USB_EP_GET_IDX(ep_cfg->addr)];
+	struct net_buf *buf;
+
+	/* Get data from endpoint */
+	buf = udc_buf_get(ep_cfg);
+
+	/* Release the endpoint now that data is acquired */
+	udc_ep_set_busy(ep_cfg, false);
+
+	/* Indicate any USB errors */
+	if (ep_request->error_code) {
+		LOG_ERR("ep 0x%02x error: %x", ep_cfg->addr, ep_request->error_code);
+		udc_submit_ep_event(dev, buf, ep_request->error_code);
+		return;
+	}
+
+	/* Check if a zero-length packet is needed */
+	if (udc_ep_buf_has_zlp(buf)) {
+		udc_ep_buf_clear_zlp(buf);
+	}
+
+	/* Submit the received buffer to the UDC stack */
+	if (ep_cfg->addr == USB_CONTROL_EP_IN) {
+		udc_event_xfer_ctrl_status(dev, buf);
+	} else {
+		udc_submit_ep_event(dev, buf, 0);
+	}
+
+	/* Start any transfer deferred while this endpoint was busy */
+	if (ep_cfg->addr != USB_CONTROL_EP_IN && udc_buf_peek(ep_cfg) != NULL) {
+		udc_event_xfer_in(dev, ep_cfg);
+	}
+}
+
+static void udc_event_xfer_out_done(const struct device *dev, struct udc_ep_config *ep_cfg)
+{
+	struct udc_max32_data *priv = udc_get_private(dev);
+	MXC_USB_Req_t *ep_request = &priv->ep_request[USB_EP_GET_IDX(ep_cfg->addr)];
+	struct net_buf *buf;
+
+	buf = udc_buf_get(ep_cfg);
+	net_buf_add(buf, ep_request->actlen);
+
+	/* Release the endpoint since transfer is done */
+	udc_ep_set_busy(ep_cfg, false);
+
+	/* Indicate any USB errors */
+	if (ep_request->error_code) {
+		LOG_ERR("ep 0x%02x error: %x", ep_cfg->addr, ep_request->error_code);
+		udc_submit_ep_event(dev, buf, ep_request->error_code);
+		return;
+	}
+
+	/* Indicate transfer done to the UDC stack */
+	if (ep_cfg->addr == USB_CONTROL_EP_OUT) {
+		/* Update to next stage of control transfer */
+		udc_ctrl_update_stage(dev, buf);
+
+		udc_ctrl_submit_s_out_status(dev, buf);
+	} else {
+		udc_submit_ep_event(dev, buf, 0);
+	}
+
+	/* Start any transfer deferred while this endpoint was busy */
+	if (ep_cfg->addr != USB_CONTROL_EP_OUT && udc_buf_peek(ep_cfg) != NULL) {
+		udc_event_xfer_out(dev, ep_cfg);
 	}
 }
 
@@ -532,8 +592,12 @@ static int udc_max32_event_callback(maxusb_event_t event, void *cbdata)
 		break;
 	case MAXUSB_EVENT_DPACT:
 		LOG_DBG("DPACT event occurred");
-		udc_set_suspended(dev, false);
-		udc_submit_sof_event(dev);
+
+		/* Only respond if device is suspended */
+		if (udc_is_suspended(dev)) {
+			udc_set_suspended(dev, false);
+			udc_submit_event(dev, UDC_EVT_RESUME, 0);
+		}
 		break;
 	case MAXUSB_EVENT_BRST:
 		LOG_DBG("BRST event occurred");
